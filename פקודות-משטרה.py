@@ -1,94 +1,81 @@
+import argparse
 import requests
-import json
-import os.path
-import shutil
-import csv
+from typing import NamedTuple, List, Any
+import os
 
-class Pkudot:
+class FetchResult(NamedTuple):
+    items: List[Any]
+    skip_next: str
 
-    def __init__(self):
-        self.u = 'https://www.gov.il/api/police/menifa/api/menifa/getDocList'
-        self.workdir = os.path.join(os.path.expanduser('~'), 'police-orders')
-        self.metadata = os.path.join(self.workdir, 'metadata.csv')
-        self.pdfs = os.path.join(self.workdir, 'pdfs')
+class ItemDataPair(NamedTuple):
+    item: Any
+    file: Any
 
-        self.csv_writer = None
-        self.metadata_file = None
+def get_page(skip: str) -> FetchResult:
+    res = requests.post('https://www.gov.il/api/police/menifa/api/menifa/getDocList', json={"skip": skip})
+    res.raise_for_status()
+    j = res.json()
+    skip_next = int(skip)+len(j['Results'])
+    return FetchResult(
+        items=j['Results'],
+        skip_next=skip_next,
+    )
 
-    def add_record(self, record):
-        if self.csv_writer is None:
-            self.metadata_file = open(self.metadata, 'w', encoding='utf-8')
-            self.csv_writer = csv.DictWriter(self.metadata_file, fieldnames=record.keys(), dialect='unix')
-            self.csv_writer.writeheader()
+def collect_items():
+    skip = "0"
+    while True:
+        res = get_page(skip)
+        items = res.items
+        if not items:
+            return
+        for item in items:
+            for file in item['Data']['fileData']:
+                yield ItemDataPair(item=item, file=file)
+        skip = res.skip_next
 
-        self.csv_writer.writerow(record)
+def download_file(source_url, dest_filename, overwrite: bool, dryrun: bool, verbose: bool):
+    res = requests.get(source_url)
+    res.raise_for_status()
+    # no clobber
+    if overwrite or os.path.exists(dest_filename) and os.path.getsize(dest_filename):
+        if verbose:
+            print(dest_filename, "NOT OVERWRITING")
+        return
+    if not dryrun:
+        with open(dest_filename, mode='wb') as f:
+            f.write(res.content)
+    if verbose:
+        print(dest_filename)
 
-    def add_records(self, records):
-        for record in records:
-            self.add_record(record)
 
-    def download_metadata(self, skip):
-        body = {'skip': skip}
-        headers = {'Content-Type': 'application/json;charset=UTF-8'}
-        r = requests.post(self.u, json=body, headers=headers).content
-        r = r.decode('utf-8')
-        r = json.loads(r)
-        return r
+def process_item(item, overwrite: bool, dryrun: bool, verbose: bool):
+    """
+    aaa {'Data': {'date_field': '01/02/2014', 'MisparPkuda': '300.01.182', 'Name': 'התייצבות משוחררים בערובה בתחנת משטרה', 'fileData': [{'FileName': 'https://www.police.gov.il/menifa/05.300.01.182_1.pdf', 'DisplayName': 'התייצבות משוחררים בערובה בתחנת משטרה', 'Extension': 'pdf'}]}}
+    """
+    source_url = item.file['FileName']
+    dest_filename = ".".join([item.file['DisplayName'], item.file['Extension']])
+    dest_filename = dest_filename.replace("/", "-")
+    try:
+        download_file(source_url, dest_filename, overwrite=overwrite, dryrun=dryrun, verbose=verbose)
+    except Expection as e:
+        print(e)
 
-    def get_results(self, j):
-        r = j['Results']
-        entries = []
-        for entry in r:
-            v = {}
-            data = entry['Data']
-            v['date_field'] = data['date_field']
-            v['mispark_pkuda'] = data['MisparPkuda']
-            v['name'] = data['Name']
-            file_data = data['fileData']
-            assert len(file_data) == 1
-            file_data = file_data[0]
-            v['filename'] = file_data['FileName']
-            v['DisplayName'] = file_data['DisplayName']
-            v['extension'] = file_data['Extension']
-            entries.append(v)
-        return entries
 
-    def close(self):
-        self.metadata_file.close()
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument("-n", "--dryrun", action="store_true", help="Do not actually download")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print downloaded filenames")
+    return parser.parse_args()
 
-    def download_all_metadata(self):
-        self.prepare()
+def main():
+    args = parse_args()
+    [
+        process_item(item, overwrite=args.overwrite, dryrun=args.dryrun, verbose=args.verbose)
+        for item in collect_items()
+    ]
 
-        skip = 0
-        while True:
-            print(f'Skip {skip}')
-            j = self.download_metadata(skip)
-            entries = self.get_results(j)
-            self.add_records(entries)
-            skip += len(entries)
-            if not entries:
-                break
 
-        self.close()
-
-    def prepare(self):
-        os.path.exists(self.workdir) and shutil.rmtree(self.workdir)
-        os.makedirs(self.workdir)
-        os.makedirs(self.pdfs)
-
-    def download_all_pdfs(self):
-        f = open(self.metadata, 'r', encoding='utf-8')
-        r = csv.DictReader(f)
-        for i, line in enumerate(r):
-            url = line['filename']
-            content = requests.get(url).content
-            filename = url.split('/')[-1]
-            destination_path = os.path.join(self.pdfs, filename)
-            with open(destination_path, 'wb') as w:
-                w.write(content)
-            print(f'Downloaded {i} to {destination_path}')
 
 if __name__=='__main__':
-    h = Pkudot()
-    h.download_all_metadata()
-    h.download_all_pdfs()
+    main()
